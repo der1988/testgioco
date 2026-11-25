@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drop the Beat — Moonybaboon</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center; background: #151325; }
+  canvas { display: block; width: min(100vw, 177.7778dvh); height: auto; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas width="320" height="180" aria-label="Drop the Beat. Press any key to start. Fly with the arrow keys. Press Space to retry."></canvas>
+<script>
+'use strict';
+
+const canvas = document.querySelector('canvas');
+const ctx = canvas.getContext('2d');
+const C = ['#151325', '#26203b', '#483052', '#774263', '#e36a52', '#ffad66', '#ffdf9b', '#8edac4'];
+const W = 320, H = 180;
+const beatLength = 60 / 128;
+const dropBeat = 7;
+const keys = new Set();
+const arrows = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+const font = {
+  A:'2|5|7|5|5', B:'6|5|6|5|6', C:'3|4|4|4|3', D:'6|5|5|5|6',
+  E:'7|4|6|4|7', F:'7|4|6|4|4', G:'3|4|5|5|3', H:'5|5|7|5|5',
+  I:'7|2|2|2|7', J:'1|1|1|5|2', K:'5|5|6|5|5', L:'4|4|4|4|7',
+  M:'5|7|7|5|5', N:'5|7|7|7|5', O:'2|5|5|5|2', P:'6|5|6|4|4',
+  Q:'2|5|5|7|3', R:'6|5|6|5|5', S:'3|4|2|1|6', T:'7|2|2|2|2',
+  U:'5|5|5|5|7', V:'5|5|5|5|2', W:'5|5|7|7|5', X:'5|5|2|5|5',
+  Y:'5|5|2|2|2', Z:'7|1|2|4|7',
+  0:'7|5|5|5|7', 1:'2|6|2|2|7', 2:'6|1|2|4|7', 3:'6|1|2|1|6',
+  4:'5|5|7|1|1', 5:'7|4|6|1|6', 6:'3|4|7|5|7', 7:'7|1|2|2|2',
+  8:'7|5|7|5|7', 9:'7|5|7|1|6', '.':'0|0|0|0|2', ':':'0|2|0|2|0',
+  '?':'6|1|2|0|2', '!':'2|2|2|0|2', '+':'0|2|7|2|0', '-':'0|0|7|0|0'
+};
+for (const glyph in font) font[glyph] = font[glyph].split('|').map(Number);
+
+function box(x, y, w, h, color) {
+  if (w <= 0 || h <= 0) return;
+  ctx.fillStyle = C[color];
+  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+}
+
+function label(str, x, y, color = 6, scale = 1, align = 'left') {
+  const width = (str.length * 4 - 1) * scale;
+  if (align === 'center') x -= width / 2;
+  if (align === 'right') x -= width;
+  for (const letter of str) {
+    font[letter]?.forEach((row, j) => {
+      for (let i = 0; i < 3; i++) {
+        if (row & (4 >> i)) box(x + i * scale, y + j * scale, scale, scale, color);
+      }
+    });
+    x += 4 * scale;
+  }
+}
+
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const mod = (value, period) => ((value % period) + period) % period;
+const hash = n => ((Math.imul(n ^ 0x9e3779b9, 1597334677) >>> 0) % 997) / 997;
+
+let audio, master, music, noise, startTime, nextStep;
+let state = 'title', player, gates, particles, score, combo, hits, best = 0;
+let lastFrame = 0, previousBeat = 0, frameBeat = 0, lastTrack = 0, nextGate;
+let quote = '', quoteUntil = 0, shake = 0, deathTime = 0, verdict = '';
+let safeCenter;
+try { best = Number(localStorage.getItem('moonybaboon.drop.best')) || 0; } catch {}
+
+function tone(time, freq, end, duration, gain, wave, output, cutoff = 0) {
+  const osc = audio.createOscillator();
+  const env = audio.createGain();
+  osc.type = wave;
+  osc.frequency.setValueAtTime(freq, time);
+  osc.frequency.exponentialRampToValueAtTime(end, time + duration);
+  osc.connect(env);
+  if (cutoff) {
+    const filter = audio.createBiquadFilter();
+    filter.frequency.value = cutoff;
+    env.connect(filter).connect(output);
+  } else {
+    env.connect(output);
+  }
+  env.gain.setValueAtTime(0.0001, time);
+  env.gain.exponentialRampToValueAtTime(gain, time + 0.006);
+  env.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+  osc.start(time);
+  osc.stop(time + duration);
+}
+
+function hiss(time, duration, gain, frequency, output) {
+  const source = audio.createBufferSource();
+  const filter = audio.createBiquadFilter();
+  const env = audio.createGain();
+  source.buffer = noise;
+  filter.type = 'highpass';
+  filter.frequency.value = frequency;
+  source.connect(filter).connect(env).connect(output);
+  env.gain.setValueAtTime(gain, time);
+  env.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+  source.start(time);
+  source.stop(time + duration);
+}
+
+const hz = note => 440 * 2 ** ((note - 69) / 12);
+const bass = [33, 33, 45, 33, 36, 33, 40, 31, 33, 33, 45, 33, 43, 40, 36, 31];
+const lead = [null, 69, null, 72, 76, null, 74, null, null, 72, null, 67, 69, null, 67, null];
+
+function scheduleMusic() {
+  const stepLength = beatLength / 4;
+  while (startTime + nextStep * stepLength < audio.currentTime + 0.12) {
+    const step = nextStep++;
+    const time = startTime + step * stepLength;
+    if (time < audio.currentTime - 0.025) continue;
+    const playing = step >= dropBeat * 4;
+    const barStep = mod(step - (playing ? dropBeat * 4 : 0), 16);
+    const note = hz(bass[barStep]);
+    if (barStep % 4 !== 3 || barStep === 15) {
+      tone(time, note, note * 0.998, barStep % 4 === 0 ? 0.17 : 0.09, 0.21,
+        'sawtooth', music, playing ? 480 : 330);
+      tone(time, note / 2, note / 2, 0.10, 0.11, 'sine', music);
+    }
+    if (!playing) continue;
+    if ([0, 6, 8, 11, 14].includes(barStep)) {
+      tone(time, 148, 38, 0.16, 0.65, 'sine', music);
+    }
+    if (barStep === 4 || barStep === 12 || barStep === 15) {
+      hiss(time, barStep === 15 ? 0.065 : 0.12, 0.27, 1300, music);
+      tone(time, 170, 93, 0.06, 0.16, 'triangle', music);
+    }
+    if (barStep % 2 === 0 || barStep === 13) {
+      hiss(time, barStep % 4 === 2 ? 0.085 : 0.033, 0.09, 6300, music);
+    }
+    if (lead[barStep]) {
+      const melody = hz(lead[barStep]);
+      tone(time, melody, melody * 0.994, 0.11, 0.055, 'square', music, 2400);
+    }
+  }
+}
+
+async function start() {
+  state = 'starting';
+  try {
+    if (!audio) {
+      audio = new AudioContext();
+      master = audio.createGain();
+      master.gain.value = 0.42;
+      master.connect(audio.destination);
+      noise = audio.createBuffer(1, Math.ceil(audio.sampleRate * 0.2), audio.sampleRate);
+      const samples = noise.getChannelData(0);
+      for (let i = 0; i < samples.length; i++) samples[i] = Math.random() * 2 - 1;
+    }
+    await audio.resume();
+  } catch {
+    state = 'title';
+    return;
+  }
+  music?.disconnect();
+  music = audio.createGain();
+  music.connect(master);
+  player = { x: 112, y: 74, vx: 0, vy: 25, invulnerable: 0 };
+  gates = [];
+  particles = [];
+  hits = score = combo = shake = 0;
+  safeCenter = 84;
+  lastTrack = previousBeat = frameBeat = 0;
+  nextGate = 5;
+  quote = '';
+  quoteUntil = 0;
+  nextStep = 0;
+  startTime = audio.currentTime + 0.055;
+  state = 'intro';
+  scheduleMusic();
+}
+
+window.addEventListener('keydown', event => {
+  if (arrows.includes(event.code) || event.code === 'Space') event.preventDefault();
+  keys.add(event.code);
+  if (event.repeat) return;
+  if (state === 'title' || (state === 'over' && event.code === 'Space')) start();
+});
+window.addEventListener('keyup', event => keys.delete(event.code));
+window.addEventListener('blur', () => keys.clear());
+
+function say(text, beat, duration = 3.5) {
+  quote = text;
+  quoteUntil = beat + duration;
+}
+
+function travel(beat) {
+  const ramp = Math.min(beat, 100);
+  return 32 * beat + 0.19 * ramp * ramp + 38 * (beat - ramp);
+}
+
+function generate(beat) {
+  while (nextGate <= beat + 10) {
+    const center = clamp(safeCenter + (Math.random() - 0.5) * 76, 50, 115);
+    const gap = Math.max(45, 75 - nextGate * 0.28);
+    const width = 15 + (Math.random() * 10 | 0);
+    gates.push({
+      beat: nextGate, center, gap, width, type: Math.random() * 3 | 0,
+      obstacle: false, scored: false
+    });
+    safeCenter = center;
+    nextGate += nextGate < 27 ? 4 : nextGate < 60 ? 3 : 2;
+  }
+}
+
+function burst(x, y, color, count, track, force) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y, color: i % 3 === 0 ? 6 : color, track,
+      vx: (Math.random() - 0.5) * force,
+      vy: (Math.random() - 0.6) * force,
+      life: 0.18 + Math.random() * 0.4
+    });
+  }
+}
+
+function crash(beat, gate) {
+  gate.obstacle = true;
+  hits++;
+  combo = 0;
+  player.invulnerable = beat + 1.35;
+  player.vy = -39;
+  shake = 0.24;
+  burst(player.x, player.y, 4, 27, 0.32, 118);
+  const time = audio.currentTime;
+  hiss(time, 0.18, 0.34, 340, master);
+  tone(time, 118, 27, 0.22, 0.39, 'sawtooth', master, 850);
+  say(['NICE. THAT WAS A BUILDING.', 'ARCHITECTURE: 2. YOU: 0.', 'EVEN THE HELICOPTER REGRETS THIS.'][hits - 1], beat);
+  if (hits < 3) return;
+  music.gain.cancelScheduledValues(time);
+  music.gain.setValueAtTime(0, time);
+  verdict = score >= 1500 ? 'ALMOST PROFESSIONAL. HOW EMBARRASSING.'
+    : score >= 500 ? 'INCREDIBLE. NOT IN A GOOD WAY.'
+    : 'GRAVITY SENDS ITS REGARDS.';
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem('moonybaboon.drop.best', String(best)); } catch {}
+  }
+  deathTime = 0;
+  state = 'fall';
+}
+
+function updateFlight(dt, beat) {
+  const p = player;
+  const oldPlayerX = p.x;
+  const oldPlayerY = p.y;
+  lastTrack = travel(beat);
+  generate(beat);
+  const xControl = Number(keys.has('ArrowRight')) - Number(keys.has('ArrowLeft'));
+  const yControl = Number(keys.has('ArrowDown')) - Number(keys.has('ArrowUp'));
+  const drag = Math.exp(-4.9 * dt);
+  p.vx = p.vx * drag + xControl * 415 * dt;
+  p.vy = p.vy * drag + (yControl * 412 + 42) * dt;
+  p.x = clamp(p.x + p.vx * dt, 34, 199);
+  p.y = clamp(p.y + p.vy * dt, 21, 149);
+
+  const oldBeat = previousBeat;
+  for (const gate of gates) {
+    // At the target beat the gate crosses the white timing marker at x=112.
+    const x = 112 + travel(gate.beat) - lastTrack;
+    const oldX = 112 + travel(gate.beat) - travel(oldBeat);
+    const clearance = gate.gap / 2 - Math.abs(p.y - gate.center) - 3;
+    if (!gate.obstacle && Math.min(x, oldX) - gate.width / 2 - 5 < p.x &&
+        Math.max(x, oldX) + gate.width / 2 + 5 > p.x &&
+        clearance <= 0 && beat >= p.invulnerable) {
+      crash(beat, gate);
+      if (state === 'fall') return;
+    }
+    if (!gate.scored && x <= p.x) {
+      gate.scored = true;
+      const before = oldX - oldPlayerX;
+      const after = p.x - x;
+      const fraction = before > 0 ? before / (before + after) : 0;
+      const crossingBeat = oldBeat + fraction * (beat - oldBeat);
+      const crossingY = oldPlayerY + fraction * (p.y - oldPlayerY);
+      const margin = gate.gap / 2 - Math.abs(crossingY - gate.center) - 3;
+      if (margin <= 0 || gate.obstacle) continue;
+      const onBeat = Math.abs(crossingBeat - Math.round(crossingBeat)) <= 0.14;
+      const close = margin < 8;
+      combo = onBeat ? Math.min(combo + 1, 7) : 0;
+      const gain = (close ? 90 : 40) * (combo + 1);
+      score += gain;
+      burst(p.x, p.y, onBeat ? 7 : 5, close ? 13 : 6, 0.5, 52);
+      if (onBeat || close) {
+        const time = audio.currentTime;
+        tone(time, hz(72 + combo), hz(79 + combo), 0.10, 0.13, 'triangle', master);
+      }
+      if (combo >= 4) say('PLEASE STOP MAKING THIS LOOK EASY.', beat);
+      else if (combo >= 2) say('ALMOST PROFESSIONAL.', beat);
+      else if (close) say('THE BUILDING FELT THAT.', beat);
+      else if (onBeat) say('SUSPICIOUSLY ON TEMPO.', beat);
+      else say('THE BASS WOULD LIKE A WORD.', beat, 2);
+    }
+  }
+  gates = gates.filter(gate => 112 + travel(gate.beat) - lastTrack + gate.width > -5);
+}
+
+function disk(x, y, radius, color) {
+  for (let row = -radius; row <= radius; row++) {
+    const span = Math.floor(Math.sqrt(radius * radius - row * row));
+    box(x - span, y + row, span * 2 + 1, 1, color);
+  }
+}
+
+function skyline(track, pulse) {
+  box(0, 0, W, H, 2);
+  box(0, 0, W, 42, 1);
+  box(0, 42, W, 27, 2);
+  box(0, 69, W, 34, 3);
+  box(0, 103, W, 56, 4);
+  disk(244, 83, 34, 5);
+  for (let i = 0; i < 6; i++) box(209, 87 + i * 5, 70, 1 + (i > 2), i > 2 ? 4 : 3);
+
+  for (let i = 0; i < 34; i++) {
+    const x = mod(hash(i + 810) * W - track * 0.045, W);
+    const y = 10 + hash(i + 901) * 47;
+    box(x, y, i % 7 === 0 ? 2 : 1, 1, i % 8 === 0 && pulse ? 6 : 3);
+  }
+
+  for (let layer = 0; layer < 2; layer++) {
+    const stride = 13 + layer * 6;
+    const offset = track * (layer ? 0.54 : 0.23);
+    const base = Math.floor(offset / stride);
+    for (let i = -1; i < W / stride + 1; i++) {
+      const id = i + base + layer * 400;
+      const x = i * stride - mod(offset, stride);
+      const h = 12 + Math.floor(hash(id) * (layer ? 43 : 31));
+      const y = 155 - h;
+      box(x, y, stride - 2, h + 5, layer ? 1 : 3);
+      if (hash(id + 15) > 0.60) box(x + 4, y - 4, 4, 4, layer ? 1 : 3);
+      if (!layer) continue;
+      for (let row = 4; row < h; row += 6) {
+        for (let col = 3; col < stride - 3; col += 5) {
+          const pattern = hash(id * 41 + col + row * 7);
+          if (pattern > 0.55) box(x + col, y + row, 2, 1, pulse && pattern > 0.77 ? 5 : 3);
+        }
+      }
+    }
+  }
+  box(0, 155, W, 4, 0);
+  for (let i = 0; i < 21; i++) box(mod(i * 17 - track * 0.9, W), 157, 5, 1, 3);
+}
+
+function helicopter(x, y, time) {
+  box(x - 32, y - 5, 17, 3, 0);
+  box(x - 32, y - 10, 3, 7, 0);
+  box(x - 34, y - 8, 7, 1, 6);
+  box(x - 19, y - 8, 29, 11, 0);
+  box(x - 15, y - 11, 20, 3, 0);
+  box(x + 10, y - 6, 4, 7, 0);
+  box(x + 14, y - 3, 2, 4, 0);
+  box(x + 2, y - 8, 6, 5, 7);
+  box(x + 8, y - 6, 3, 3, 7);
+  box(x - 13, y - 5, 7, 5, 2);
+  box(x - 17, y + 1, 28, 1, 4);
+  box(x - 11, y + 3, 2, 4, 0);
+  box(x + 4, y + 3, 2, 4, 0);
+  box(x - 15, y + 7, 24, 1, 0);
+  box(x - 4, y - 15, 2, 5, 0);
+  const rotor = [21, 13, 4, 15][Math.floor(time * 32) % 4];
+  box(x - 3 - rotor, y - 15, rotor * 2 + 1, 1, 6);
+}
+
+function pilot(x, y, deployed, tilt = 0) {
+  box(x - 3, y - 2, 7, 6, 0);
+  if (deployed) {
+    box(x - 6, y + 1 - tilt, 8, 3, 7);
+    box(x - 4, y + 4 - tilt, 4, 1, 7);
+    box(x + 2, y + 1, 4, 2, 5);
+  } else {
+    box(x - 3, y + 4, 2, 2, 5);
+  }
+  box(x - 1, y - 4, 4, 3, 6);
+  box(x + 1, y - 3, 3, 1, 0);
+  box(x, y, 3, 2, 4);
+}
+
+function drawGate(gate, beat, pulse) {
+  const x = Math.round(112 + travel(gate.beat) - lastTrack - gate.width / 2);
+  if (x > W || x + gate.width < 0) return;
+  const w = gate.width;
+  const top = Math.round(gate.center - gate.gap / 2);
+  const bottom = Math.round(gate.center + gate.gap / 2);
+  const lit = pulse ? 7 : 5;
+  box(x, 15, w, top - 15, 0);
+  box(x, bottom, w, 155 - bottom, 0);
+  box(x, top - 2, w, 2, lit);
+  box(x, bottom, w, 2, lit);
+
+  if (gate.type === 0) {
+    for (let row = bottom + 5; row < 152; row += 6) {
+      for (let col = 3; col < w - 3; col += 5) {
+        if (hash(gate.beat * 31 + row * 13 + col) > 0.28) {
+          box(x + col, row, 2, 2, pulse ? 5 : 3);
+        }
+      }
+    }
+    box(x + w - 4, 17, 1, top - 21, 3);
+  } else if (gate.type === 1) {
+    const mast = x + Math.floor(w / 2);
+    box(x + 2, bottom + 3, w - 4, 148 - bottom, 1);
+    box(x, bottom + 3, w, 3, 4);
+    box(mast - 2, bottom + 6, 1, 149 - bottom - 6, 5);
+    box(mast + 3, bottom + 6, 1, 149 - bottom - 6, 5);
+    for (let row = bottom + 7; row < 145; row += 5) {
+      for (let rung = 0; rung < 5; rung++) box(mast - 1 + rung, row + rung, 1, 1, 4);
+    }
+    box(x + w - 3, bottom + 6, 1, 8, 3);
+    box(x + w - 4, bottom + 13, 2, 2, 5);
+  } else {
+    box(x + 2, bottom + 3, w - 4, 7, 2);
+    box(x + w / 2, bottom + 10, 2, 142 - bottom, 4);
+    box(x + 3, bottom + 12, w - 6, 1, 5);
+    box(x + 3, 17, w - 6, top - 22, 2);
+    const antenna = x + Math.floor(w / 2);
+    box(antenna, 18, 1, top - 21, 5);
+    for (let row = 22; row < top - 3; row += 6) box(antenna - 3, row, 7, 1, 4);
+  }
+
+  if (!gate.scored && Math.abs(beat - gate.beat) < 1.2) {
+    const mid = Math.round(x + w / 2);
+    box(mid - 3, gate.center, 2, 1, lit);
+    box(mid + 2, gate.center, 2, 1, lit);
+    box(mid, gate.center - 2, 1, 5, lit);
+  }
+}
+
+function draw(now, beat) {
+  const live = state === 'flight';
+  const inGame = live || state === 'fall' || state === 'over';
+  const title = state === 'title' || state === 'starting';
+  const pulse = mod(title ? now / beatLength : frameBeat, 1) < 0.15;
+  const track = title ? now * 31 : state === 'intro' ? frameBeat * 19 : lastTrack;
+  box(0, 0, W, H, 0);
+  ctx.save();
+  if (shake > 0) ctx.translate(Math.round((Math.random() - 0.5) * 13 * shake), Math.round((Math.random() - 0.5) * 13 * shake));
+  skyline(track, pulse);
+  if (title) {
+    helicopter(80 + Math.sin(now * 0.83) * 32, 117 + Math.sin(now * 3) * 3, now);
+  } else if (state === 'intro') {
+    const x = -33 + (frameBeat / dropBeat) * 145;
+    const y = 56 + Math.sin(frameBeat * 1.8) * 2;
+    helicopter(x, y, now);
+    box(x - 1, y + 8, 1, 7, 6);
+    pilot(x, y + 18, false);
+  } else if (inGame) {
+    for (const gate of gates) drawGate(gate, beat, pulse && live);
+    if (live && beat < 2) {
+      helicopter(112 + beat * 125, 56 - beat * 20, now);
+    }
+    if (state === 'fall' || (live && (beat >= player.invulnerable || Math.floor(now * 22) % 2))) {
+      pilot(player.x, player.y, live && beat >= 0.12, Math.sign(player.vy));
+    }
+    for (const part of particles) box(part.x, part.y, part.life > 0.24 ? 2 : 1, 1, part.color);
+  }
+  ctx.restore();
+
+  if (title) {
+    label('MOONYBABOON PRESENTS', 160, 24, 7, 1, 'center');
+    label('DROP THE', 162, 37, 0, 4, 'center');
+    label('DROP THE', 160, 34, 6, 4, 'center');
+    label('BEAT', 162, 63, 0, 7, 'center');
+    label('BEAT', 160, 60, 5, 7, 'center');
+    box(0, 159, W, 21, 0);
+    label('PRESS ANY KEY TO MAKE A BAD DECISION.', 160, 167, pulse ? 7 : 6, 1, 'center');
+    return;
+  }
+
+  box(0, 0, W, 15, 0);
+  label('SCORE ' + String(score).padStart(6, '0'), 7, 5);
+  label('X' + (combo + 1), 137, 5, combo ? 7 : 5);
+  for (let i = 0; i < 4; i++) {
+    box(155 + i * 9, 6, 6, 3, i === Math.floor(mod(beat, 4)) ? (pulse ? 7 : 5) : 2);
+  }
+  for (let i = 0; i < 3; i++) box(292 + i * 8, 5, 5, 5, i < 3 - hits ? 4 : 2);
+  if (live) box(111, 15, 3, 2, pulse ? 7 : 5);
+  box(0, 159, W, 21, 0);
+  if (state === 'intro') {
+    label('FLIGHT INSTRUCTIONS: ARROW KEYS.', 160, 167, 6, 1, 'center');
+  } else if (beat < quoteUntil) {
+    label(quote, 160, 167, hits && beat < player.invulnerable ? 5 : 7, 1, 'center');
+  }
+  if (state === 'over') {
+    box(29, 40, 262, 104, 0);
+    box(29, 40, 262, 1, 4);
+    box(29, 143, 262, 1, 4);
+    label('GAME OVER', 160, 52, 5, 4, 'center');
+    label(verdict, 160, 83, 7, 1, 'center');
+    label('SCORE ' + score + '    BEST ' + best, 160, 97, 6, 1, 'center');
+    label('MAKE ANOTHER BAD DECISION?', 160, 115, 6, 1, 'center');
+    label('PRESS SPACE.', 160, 129, 5, 1, 'center');
+  }
+}
+
+function frame(ms) {
+  const now = ms / 1000;
+  const dt = Math.min(now - lastFrame, 0.04);
+  lastFrame = now;
+  if (state === 'intro' || state === 'flight') {
+    scheduleMusic();
+    frameBeat = Math.max(0, (audio.currentTime - startTime) / beatLength);
+  }
+  const beat = Math.max(0, frameBeat - dropBeat);
+  if (state === 'intro' && frameBeat >= dropBeat) {
+    state = 'flight';
+    player.y = 74 + Math.sin(dropBeat * 1.8) * 2;
+    say('UNFORTUNATELY, YOU ARE THE PILOT.', beat, 4);
+    shake = 0.16;
+    burst(player.x, player.y, 7, 12, 0.4, 65);
+  }
+  if (state === 'flight') updateFlight(dt, beat);
+  if (state === 'fall') {
+    deathTime += dt;
+    player.vy += 370 * dt;
+    player.y += player.vy * dt;
+    player.x += 33 * dt;
+    if (deathTime > 0.8) state = 'over';
+  }
+  if (particles) {
+    const scroll = Math.max(0, travel(beat) - travel(previousBeat));
+    for (const part of particles) {
+      part.x += part.vx * dt - scroll * part.track;
+      part.y += part.vy * dt;
+      part.vy += 33 * dt;
+      part.life -= dt;
+    }
+    particles = particles.filter(part => part.life > 0);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt);
+  draw(now, beat);
+  previousBeat = beat;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
